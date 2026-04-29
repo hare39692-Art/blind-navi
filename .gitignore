@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pt
+runs/
+.env
+result.jpg
+*.jpg
+*.png
