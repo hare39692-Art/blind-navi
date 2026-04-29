@@ -1,16 +1,23 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, session
 from flask_cors import CORS
 from PIL import Image
 import io
 import re
 import requests as req
 import os
+from collections import defaultdict
+import time
 
 app = Flask(__name__)
 CORS(app)
+app.secret_key = os.environ.get("SECRET_KEY", "blind-assist-secret")
 
 # Load YOLO lazily — only when first request comes in
 model = None
+
+# Room mapping and session tracking
+room_layout = {}  # Store detected room layout per session
+session_obstacles = defaultdict(list)  # Track obstacles over time
 
 def get_model():
     global model
@@ -65,6 +72,76 @@ def get_distance(box_height, frame_height):
     else:
         return "far"
 
+def find_exits(landmarks):
+    """Find and prioritize exits (doors, stairs) for blind user."""
+    exits = [l for l in landmarks if l["name"] in ["door", "stairs"]]
+    if not exits:
+        return None
+    # Prioritize exits in center, then left, then right
+    zone_priority = {"center": 0, "left": 1, "right": 2}
+    exits.sort(key=lambda x: zone_priority.get(x["zone"], 3))
+    return exits[0] if exits else None
+
+def build_room_map(obstacles):
+    """Create a simple room layout map from detected obstacles."""
+    zones = {"left": [], "center": [], "right": []}
+    for obs in obstacles:
+        zones[obs["zone"]].append(obs["name"])
+    return zones
+
+def get_avoidance_strategy(obstacles, landmarks, frame_width):
+    """Build detailed avoidance strategy for blind user."""
+    if not obstacles and not landmarks:
+        return "Path is clear. You can move forward safely."
+    
+    if obstacles:
+        center_obs = [o for o in obstacles if o["zone"] == "center"]
+        left_obs = [o for o in obstacles if o["zone"] == "left"]
+        right_obs = [o for o in obstacles if o["zone"] == "right"]
+        
+        # Priority: detect very close obstacles first
+        danger_obs = [o for o in obstacles 
+                      if o["distance"] in ["very_close", "close"]]
+        
+        if danger_obs:
+            obs = danger_obs[0]
+            if obs["zone"] == "center":
+                if left_obs:
+                    return f"DANGER! {obs['name']} directly ahead. Recommend moving RIGHT to clear it."
+                elif right_obs:
+                    return f"DANGER! {obs['name']} directly ahead. Recommend moving LEFT to clear it."
+                else:
+                    return f"DANGER! {obs['name']} directly ahead. Move LEFT or RIGHT to avoid."
+            elif obs["zone"] == "left":
+                return f"{obs['name']} detected on LEFT, very close. Move RIGHT carefully and forward."
+            else:
+                return f"{obs['name']} detected on RIGHT, very close. Move LEFT carefully and forward."
+        
+        # Handle nearby obstacles
+        if center_obs:
+            obs = center_obs[0]
+            if obs["distance"] == "nearby":
+                return f"{obs['name']} ahead at {obs['distance']} distance. Prepare to move around it."
+            return f"{obs['name']} ahead. Move to the side when closer."
+        elif left_obs and right_obs:
+            return f"Obstacles detected on both sides ({left_obs[0]['name']}, {right_obs[0]['name']}). Move forward carefully."
+        elif left_obs:
+            return f"{left_obs[0]['name']} on your LEFT. Safe to move forward or move RIGHT."
+        elif right_obs:
+            return f"{right_obs[0]['name']} on your RIGHT. Safe to move forward or move LEFT."
+    
+    # Suggest landmarks/exits
+    exits = find_exits(landmarks)
+    if exits:
+        if exits["zone"] == "center":
+            return f"EXIT detected ahead. Move forward towards the {exits['name']}."
+        elif exits["zone"] == "left":
+            return f"EXIT detected on your LEFT. Move LEFT to find the {exits['name']}."
+        else:
+            return f"EXIT detected on your RIGHT. Move RIGHT to find the {exits['name']}."
+    
+    return "Path is clear. Move forward carefully."
+
 def build_english_instruction(
         obstacles, landmarks, alert_level):
     if not obstacles and not landmarks:
@@ -79,6 +156,34 @@ def build_english_instruction(
         else:
             return f"{o['name']} on right. Move left."
     return "Path is clear."
+
+def get_fallback_directions(origin_lat, origin_lng):
+    """Provide fallback indoor navigation when API fails."""
+    return {
+        "steps": [
+            {
+                "instruction": "Stand up and face forward. Camera will detect obstacles ahead.",
+                "distance": "Initial",
+                "duration": "Ready"
+            },
+            {
+                "instruction": "Follow the voice guidance from the camera to navigate around obstacles.",
+                "distance": "As you move",
+                "duration": "Continuous"
+            },
+            {
+                "instruction": "Listen for alerts about obstacles on your left, right, or center.",
+                "distance": "Real-time",
+                "duration": "Always active"
+            }
+        ],
+        "total_distance": "Local navigation",
+        "total_duration": "Guide until destination",
+        "destination_name": "Current Location - Indoor Navigation",
+        "first_instruction": "Stand up. Face forward. Camera will guide you.",
+        "fallback_mode": True,
+        "mode_message": "Map service unavailable. Using local obstacle detection mode."
+    }
 
 @app.route("/", methods=["GET"])
 def home():
@@ -186,15 +291,37 @@ def navigate():
                     object_name     = right_obs[0]["name"]
                     distance_key    = right_obs[0]["distance"]
 
+        # Build room layout map
+        room_map = build_room_map(obstacles)
+        
+        # Find exits for emergency guidance
+        exit_found = find_exits(landmarks)
+        exit_guidance = ""
+        if exit_found:
+            if exit_found["zone"] == "center":
+                exit_guidance = f"Exit ({exit_found['name']}) detected ahead."
+            elif exit_found["zone"] == "left":
+                exit_guidance = f"Exit ({exit_found['name']}) on your left."
+            else:
+                exit_guidance = f"Exit ({exit_found['name']}) on your right."
+        
+        # Get enhanced avoidance strategy
+        avoidance_strategy = get_avoidance_strategy(obstacles, landmarks, frame_width)
+
         return jsonify({
-            "obstacles":         obstacles,
-            "landmarks":         landmarks,
-            "alert_level":       alert_level,
-            "instruction_key":   instruction_key,
-            "object_name":       object_name,
-            "distance_key":      distance_key,
-            "voice_instruction": build_english_instruction(
-                obstacles, landmarks, alert_level)
+            "obstacles":             obstacles,
+            "landmarks":             landmarks,
+            "alert_level":           alert_level,
+            "instruction_key":       instruction_key,
+            "object_name":           object_name,
+            "distance_key":          distance_key,
+            "voice_instruction":     build_english_instruction(
+                obstacles, landmarks, alert_level),
+            "avoidance_strategy":    avoidance_strategy,
+            "room_layout":           room_map,
+            "exit_guidance":         exit_guidance,
+            "has_exit":              exit_found is not None,
+            "detailed_guidance":     avoidance_strategy
         })
 
     except Exception as e:
@@ -227,11 +354,8 @@ def get_directions():
         geo_data = geo_response.json()
 
         if not geo_data.get("features"):
-            return jsonify({
-                "error": "Destination not found",
-                "tip": ("Try adding city name, "
-                        "e.g. 'market, Bangarmau, UP'")
-            }), 400
+            print("Destination not found - falling back to local navigation")
+            return jsonify(get_fallback_directions(origin_lat, origin_lng)), 400
 
         dest_coords = (
             geo_data["features"][0]
@@ -270,10 +394,8 @@ def get_directions():
         dir_data = dir_response.json()
 
         if "routes" not in dir_data:
-            return jsonify({
-                "error":  "No route found",
-                "detail": str(dir_data)
-            }), 400
+            print(f"No route found - falling back to local navigation: {dir_data}")
+            return jsonify(get_fallback_directions(origin_lat, origin_lng)), 400
 
         route    = dir_data["routes"][0]
         summary  = route["summary"]
@@ -303,11 +425,110 @@ def get_directions():
             "destination_name":  dest_name,
             "first_instruction": (
                 steps[0]["instruction"]
-                if steps else "Start walking")
+                if steps else "Start walking"),
+            "fallback_mode":     False,
+            "mode_message":      "GPS navigation active"
         })
 
     except Exception as e:
         print(f"Directions error: {e}")
+        # Return fallback guidance instead of just error
+        try:
+            data = request.json
+            origin_lat = data.get("lat")
+            origin_lng = data.get("lng")
+            return jsonify(get_fallback_directions(origin_lat, origin_lng))
+        except:
+            return jsonify({"error": str(e), "fallback_mode": True}), 500
+
+@app.route("/find-exit", methods=["POST"])
+def find_exit():
+    """Emergency endpoint: Help blind user find nearest exit from current room."""
+    if "image" not in request.files:
+        return jsonify({"error": "No image sent"}), 400
+
+    try:
+        image_file = request.files["image"]
+        image = Image.open(
+            io.BytesIO(image_file.read())).convert("RGB")
+        frame_width, frame_height = image.size
+
+        yolo = get_model()
+        results = yolo(image, verbose=False)
+        result  = results[0]
+
+        obstacles   = []
+        landmarks   = []
+        exits_found = []
+
+        for box in result.boxes:
+            class_id   = int(box.cls)
+            name       = result.names[class_id]
+            confidence = float(box.conf)
+
+            if confidence < 0.5:
+                continue
+
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            center_x   = (x1 + x2) / 2
+            box_height = y2 - y1
+
+            zone      = get_zone(center_x, frame_width)
+            distance  = get_distance(box_height, frame_height)
+
+            if name in OBSTACLES:
+                obstacles.append({
+                    "name":     name,
+                    "zone":     zone,
+                    "distance": distance
+                })
+            elif name in LANDMARKS:
+                landmarks.append({
+                    "name": name,
+                    "zone": zone
+                })
+                if name in ["door", "stairs"]:
+                    exits_found.append({
+                        "name": name,
+                        "zone": zone
+                    })
+
+        # Find nearest exit
+        exit_path = find_exits(landmarks)
+        
+        if not exit_path:
+            return jsonify({
+                "exit_found": False,
+                "guidance": "No exit detected. Scan the room. Look for doors or stairs.",
+                "instruction": "Turn left or right and scan again.",
+                "obstacles_around": obstacles
+            })
+
+        exit_direction = ""
+        if exit_path["zone"] == "center":
+            exit_direction = "Go forward towards the exit."
+            if obstacles:
+                center_obs = [o for o in obstacles if o["zone"] == "center"]
+                if center_obs:
+                    exit_direction = f"Exit ahead but {center_obs[0]['name']} detected. Go around it carefully, then head to the exit."
+        elif exit_path["zone"] == "left":
+            exit_direction = "Turn left. Move towards the exit on your left."
+        else:
+            exit_direction = "Turn right. Move towards the exit on your right."
+
+        return jsonify({
+            "exit_found": True,
+            "exit_type": exit_path["name"],
+            "exit_zone": exit_path["zone"],
+            "guidance": exit_direction,
+            "instruction": f"Exit ({exit_path['name']}) detected. Follow this guidance to reach it.",
+            "obstacles_in_path": [o for o in obstacles if o["zone"] == exit_path["zone"]],
+            "all_obstacles": obstacles,
+            "all_landmarks": landmarks
+        })
+
+    except Exception as e:
+        print(f"Find exit error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
