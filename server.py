@@ -21,7 +21,7 @@ def get_model():
     return model
 
 ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImUyZjMzNDkyYzllNzQ4NTViMTE4Mzg1YThiMjU5NTY4IiwiaCI6Im11cm11cjY0In0="
-
+ORS_API_KEY = os.environ.get("ORS_API_KEY")
 print("Blind Assist Server starting...")
 
 OBSTACLES = [
